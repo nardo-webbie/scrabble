@@ -15,8 +15,8 @@ async function tryDefinitionEndpoint(candidate) {
   if (!r.ok) return null;
   const data = await r.json();
 
-  // Definities zijn per taalcode gegroepeerd. Geef de voorkeur aan "nl", anders de eerste beschikbare taal.
-  const langKey = data.nl ? 'nl' : Object.keys(data)[0];
+  // De taalsleutel verschilt per editie: soms ISO-code ("nl"), soms de volle naam ("Nederlands").
+  const langKey = ['nl', 'Nederlands', 'Dutch'].find(k => data[k] && data[k].length) || Object.keys(data)[0];
   const block = data[langKey];
   if (!block || !block.length) return null;
 
@@ -24,9 +24,12 @@ async function tryDefinitionEndpoint(candidate) {
   const def = entry.definitions && entry.definitions[0];
   if (!def || !def.definition) return null;
 
+  const defText = stripTags(def.definition);
+  if (!defText || defText.length < 3) return null; // lege of te korte "definitie" is waarschijnlijk ruis
+
   const parts = [];
   if (entry.partOfSpeech) parts.push('(' + entry.partOfSpeech + ')');
-  parts.push(stripTags(def.definition));
+  parts.push(defText);
 
   return {
     found: true,
@@ -36,6 +39,13 @@ async function tryDefinitionEndpoint(candidate) {
     sourceUrl: 'https://nl.wiktionary.org/wiki/' + encodeURIComponent(candidate),
   };
 }
+
+// Regels die alleen een sectiekop of woordsoort-label zijn (geen echte definitie), om over te slaan.
+const HEADER_LIKE = new Set([
+  'nederlands', 'engels', 'duits', 'frans', 'latijn',
+  'zelfstandig naamwoord', 'werkwoord', 'bijvoeglijk naamwoord', 'bijwoord',
+  'uitspraak', 'vertalingen', 'synoniemen', 'woordafbreking', 'etymologie',
+]);
 
 async function tryActionApiExtract(candidate) {
   const url = 'https://nl.wiktionary.org/w/api.php?action=query&titles=' + encodeURIComponent(candidate)
@@ -48,11 +58,22 @@ async function tryActionApiExtract(candidate) {
   const page = Object.values(pages)[0];
   if (!page || page.missing !== undefined || !page.extract) return null;
 
-  const firstChunk = page.extract.split('\n').filter(Boolean)[0] || page.extract;
+  const lines = page.extract.split('\n').map(l => l.trim()).filter(Boolean);
+
+  // 1. Geef de voorkeur aan een genummerde definitieregel ("1. ...", "2. ...").
+  let pick = lines.find(l => /^\d+\.\s*\S/.test(l));
+
+  // 2. Anders: de eerste regel die geen bekende sectiekop/woordsoort-label is.
+  if (!pick) {
+    pick = lines.find(l => !HEADER_LIKE.has(l.toLowerCase()) && l.length > 15);
+  }
+
+  if (!pick) return null;
+
   return {
     found: true,
     title: page.title || candidate,
-    extract: firstChunk.slice(0, 300),
+    extract: pick.replace(/^\d+\.\s*/, '').slice(0, 300),
     source: 'wiktionary-extract',
     sourceUrl: 'https://nl.wiktionary.org/wiki/' + encodeURIComponent(candidate),
   };
