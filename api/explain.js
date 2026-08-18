@@ -1,4 +1,12 @@
-const UA = 'scrabble-checker-nl/1.0 (https://github.com/; contact via project owner)';
+const UA = 'scrabble-checker-nl/1.0 (+https://vercel.com; contact via project owner)';
+
+// De woordsoort-koppen zoals ze op nl.wiktionary voorkomen (zie WikiWoordenboek:Zelfstandig_naamwoord,
+// WikiWoordenboek:Werkwoord, etc.) — dit is de structuur waarin elk woord wordt beschreven.
+const POS_HEADERS = [
+  'zelfstandig naamwoord', 'werkwoord', 'bijvoeglijk naamwoord', 'bijwoord',
+  'voornaamwoord', 'telwoord', 'voegwoord', 'voorzetsel', 'tussenwerpsel',
+  'lidwoord', 'eigennaam', 'achtervoegsel', 'voorvoegsel',
+];
 
 function stripTags(html) {
   return html
@@ -9,13 +17,86 @@ function stripTags(html) {
     .trim();
 }
 
+// Zet Wikitekst-opmaak (templates, links, vet/cursief) om naar leesbare platte tekst.
+function cleanWikitext(line) {
+  let s = line;
+
+  // {{context|natuurkunde|...}} of {{contekst|...}} -> "(natuurkunde)"
+  s = s.replace(/\{\{\s*(?:context|contekst)\s*\|([^}]+)\}\}/gi, (_, args) => {
+    const parts = args.split('|').filter(a => a && !/^(nld|nl)$/i.test(a.trim()));
+    return parts.length ? '(' + parts.join(', ') + ')' : '';
+  });
+
+  // Overige templates: verwijder.
+  s = s.replace(/\{\{[^{}]*\}\}/g, '');
+
+  // [[doel|weergave]] -> weergave, [[doel]] -> doel
+  s = s.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2');
+  s = s.replace(/\[\[([^\]]+)\]\]/g, '$1');
+
+  // ''cursief'' / '''vet''' -> gewone tekst
+  s = s.replace(/'{2,3}/g, '');
+
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+async function findPosSectionIndex(candidate) {
+  const url = 'https://nl.wiktionary.org/w/api.php?action=parse&page=' + encodeURIComponent(candidate)
+    + '&prop=sections&format=json&redirects=1';
+  const r = await fetch(url, { headers: { 'User-Agent': UA } });
+  if (!r.ok) return null;
+  const data = await r.json();
+  const sections = data.parse && data.parse.sections;
+  if (!sections || !sections.length) return null;
+
+  const match = sections.find(s => POS_HEADERS.includes((s.line || '').trim().toLowerCase()));
+  if (!match) return null;
+
+  return { index: match.index, heading: match.line, pageTitle: data.parse.title };
+}
+
+async function extractDefinitionFromSection(candidate, sectionIndex) {
+  const url = 'https://nl.wiktionary.org/w/api.php?action=parse&page=' + encodeURIComponent(candidate)
+    + '&section=' + encodeURIComponent(sectionIndex) + '&prop=wikitext&format=json&redirects=1';
+  const r = await fetch(url, { headers: { 'User-Agent': UA } });
+  if (!r.ok) return null;
+  const data = await r.json();
+  const wikitext = data.parse && data.parse.wikitext && data.parse.wikitext['*'];
+  if (!wikitext) return null;
+
+  const lines = wikitext.split('\n');
+  // Definitieregels beginnen met precies een "#" (geen "#*" citaat, geen "#:" toelichting).
+  const defLine = lines.find(l => /^#(?![#:*])\s*\S/.test(l.trim()));
+  if (!defLine) return null;
+
+  const cleaned = cleanWikitext(defLine.replace(/^#\s*/, ''));
+  if (!cleaned || cleaned.length < 3) return null;
+
+  return cleaned;
+}
+
+async function tryStructuredLookup(candidate) {
+  const section = await findPosSectionIndex(candidate);
+  if (!section) return null;
+
+  const defText = await extractDefinitionFromSection(candidate, section.index);
+  if (!defText) return null;
+
+  return {
+    found: true,
+    title: section.pageTitle || candidate,
+    extract: '(' + section.heading + ') ' + defText,
+    source: 'wiktionary-section',
+    sourceUrl: 'https://nl.wiktionary.org/wiki/' + encodeURIComponent(candidate),
+  };
+}
+
 async function tryDefinitionEndpoint(candidate) {
   const url = 'https://nl.wiktionary.org/api/rest_v1/page/definition/' + encodeURIComponent(candidate);
   const r = await fetch(url, { headers: { 'User-Agent': UA } });
   if (!r.ok) return null;
   const data = await r.json();
 
-  // De taalsleutel verschilt per editie: soms ISO-code ("nl"), soms de volle naam ("Nederlands").
   const langKey = ['nl', 'Nederlands', 'Dutch'].find(k => data[k] && data[k].length) || Object.keys(data)[0];
   const block = data[langKey];
   if (!block || !block.length) return null;
@@ -25,7 +106,7 @@ async function tryDefinitionEndpoint(candidate) {
   if (!def || !def.definition) return null;
 
   const defText = stripTags(def.definition);
-  if (!defText || defText.length < 3) return null; // lege of te korte "definitie" is waarschijnlijk ruis
+  if (!defText || defText.length < 3) return null;
 
   const parts = [];
   if (entry.partOfSpeech) parts.push('(' + entry.partOfSpeech + ')');
@@ -36,45 +117,6 @@ async function tryDefinitionEndpoint(candidate) {
     title: candidate,
     extract: parts.join(' '),
     source: 'wiktionary-definition',
-    sourceUrl: 'https://nl.wiktionary.org/wiki/' + encodeURIComponent(candidate),
-  };
-}
-
-// Regels die alleen een sectiekop of woordsoort-label zijn (geen echte definitie), om over te slaan.
-const HEADER_LIKE = new Set([
-  'nederlands', 'engels', 'duits', 'frans', 'latijn',
-  'zelfstandig naamwoord', 'werkwoord', 'bijvoeglijk naamwoord', 'bijwoord',
-  'uitspraak', 'vertalingen', 'synoniemen', 'woordafbreking', 'etymologie',
-]);
-
-async function tryActionApiExtract(candidate) {
-  const url = 'https://nl.wiktionary.org/w/api.php?action=query&titles=' + encodeURIComponent(candidate)
-    + '&prop=extracts&explaintext=1&exsectionformat=plain&format=json&redirects=1';
-  const r = await fetch(url, { headers: { 'User-Agent': UA } });
-  if (!r.ok) return null;
-  const data = await r.json();
-  const pages = data.query && data.query.pages;
-  if (!pages) return null;
-  const page = Object.values(pages)[0];
-  if (!page || page.missing !== undefined || !page.extract) return null;
-
-  const lines = page.extract.split('\n').map(l => l.trim()).filter(Boolean);
-
-  // 1. Geef de voorkeur aan een genummerde definitieregel ("1. ...", "2. ...").
-  let pick = lines.find(l => /^\d+\.\s*\S/.test(l));
-
-  // 2. Anders: de eerste regel die geen bekende sectiekop/woordsoort-label is.
-  if (!pick) {
-    pick = lines.find(l => !HEADER_LIKE.has(l.toLowerCase()) && l.length > 15);
-  }
-
-  if (!pick) return null;
-
-  return {
-    found: true,
-    title: page.title || candidate,
-    extract: pick.replace(/^\d+\.\s*/, '').slice(0, 300),
-    source: 'wiktionary-extract',
     sourceUrl: 'https://nl.wiktionary.org/wiki/' + encodeURIComponent(candidate),
   };
 }
@@ -93,13 +135,15 @@ module.exports = async (req, res) => {
   ];
 
   for (const candidate of candidates) {
+    // 1. Meest betrouwbaar: pak de sectie die exact bij een woordsoort-kop hoort en lees de wikitekst-lijst.
     try {
-      const result = await tryDefinitionEndpoint(candidate);
+      const result = await tryStructuredLookup(candidate);
       if (result) { res.status(200).json(result); return; }
     } catch (e) { /* probeer volgende bron */ }
 
+    // 2. Terugval: de structured REST-endpoint (werkt niet voor elk woord).
     try {
-      const result = await tryActionApiExtract(candidate);
+      const result = await tryDefinitionEndpoint(candidate);
       if (result) { res.status(200).json(result); return; }
     } catch (e) { /* probeer volgende kandidaat */ }
   }
