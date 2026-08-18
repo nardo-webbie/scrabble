@@ -1,19 +1,13 @@
 const UA = 'scrabble-checker-nl/1.0 (+https://vercel.com; contact via project owner)';
 
-const POS_HEADERS = new Set([
-  'zelfstandig naamwoord', 'werkwoord', 'bijvoeglijk naamwoord', 'bijwoord',
-  'voornaamwoord', 'telwoord', 'voegwoord', 'voorzetsel', 'tussenwerpsel',
-  'lidwoord', 'eigennaam', 'achtervoegsel', 'voorvoegsel',
-]);
-
-function normHeading(s) {
-  return (s || '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase()
-    .replace(/\s*\d+$/, ''); // "zelfstandig naamwoord 2" -> "zelfstandig naamwoord"
-}
+// Wiktionary-ankers gebruiken underscores i.p.v. spaties, en zijn de HTML-id's van de
+// woordsoort-koppen zoals ze op elke pagina voorkomen (zie WikiWoordenboek:Zelfstandig_naamwoord,
+// WikiWoordenboek:Werkwoord, etc.).
+const POS_ANCHORS = [
+  'Zelfstandig_naamwoord', 'Werkwoord', 'Bijvoeglijk_naamwoord', 'Bijwoord',
+  'Voornaamwoord', 'Telwoord', 'Voegwoord', 'Voorzetsel', 'Tussenwerpsel',
+  'Lidwoord', 'Eigennaam', 'Achtervoegsel', 'Voorvoegsel',
+];
 
 function stripTags(html) {
   return html
@@ -24,63 +18,53 @@ function stripTags(html) {
     .trim();
 }
 
-
 async function fetchJson(url) {
   const r = await fetch(url, { headers: { 'User-Agent': UA } });
   if (!r.ok) return null;
   return r.json();
 }
 
-// Zoek de eerste woordsoort-sectie die bij het Nederlandse taalblok hoort (niet bij een
-// eventueel ander-talig blok verderop op dezelfde pagina).
-async function findPosSectionIndex(candidate) {
+// De sectie-index van de Action API is niet bruikbaar voor sjabloon-gegenereerde koppen
+// (die krijgen allemaal dezelfde placeholder-index "T-1"). Daarom: één keer de volledige
+// gerenderde pagina ophalen en daarin zelf op het HTML-anker zoeken.
+async function tryStructuredLookup(candidate) {
   const data = await fetchJson('https://nl.wiktionary.org/w/api.php?action=parse&page='
-    + encodeURIComponent(candidate) + '&prop=sections&format=json&redirects=1');
-  const sections = data && data.parse && data.parse.sections;
-  if (!sections || !sections.length) return null;
-
-  const nlIdx = sections.findIndex(s => normHeading(s.line) === 'nederlands' && s.toclevel === 1);
-  const searchFrom = nlIdx === -1 ? 0 : nlIdx + 1;
-  const searchTo = sections.findIndex((s, i) => i > searchFrom && s.toclevel === 1);
-  const slice = sections.slice(searchFrom, searchTo === -1 ? undefined : searchTo);
-
-  const match = (nlIdx === -1 ? sections : slice).find(s => POS_HEADERS.has(normHeading(s.line)));
-  if (!match) return null;
-
-  return { index: match.index, heading: match.line, pageTitle: data.parse.title };
-}
-
-async function extractDefinitionFromSection(candidate, sectionIndex) {
-  // Gerenderde HTML van alleen deze sectie ophalen — templates, audiospelers, etc. zijn dan al
-  // door Wiktionary zelf omgezet, dus we hoeven alleen de eerste <li> van de definitielijst te lezen.
-  const data = await fetchJson('https://nl.wiktionary.org/w/api.php?action=parse&page='
-    + encodeURIComponent(candidate) + '&section=' + encodeURIComponent(sectionIndex)
-    + '&prop=text&format=json&redirects=1');
+    + encodeURIComponent(candidate) + '&prop=text&format=json&redirects=1');
   const html = data && data.parse && data.parse.text && data.parse.text['*'];
   if (!html) return null;
 
-  const match = html.match(/<ol[^>]*>[\s\S]*?<li[^>]*>([\s\S]*?)(?:<li[^>]*>|<\/ol>|<ol[^>]*>)/);
+  // Alleen binnen het Nederlandse taalblok zoeken, niet in een eventueel ander-talig blok
+  // verderop op dezelfde pagina.
+  const nlIdx = html.indexOf('id="Nederlands"');
+  if (nlIdx === -1) return null;
+  const nextLangIdx = html.indexOf('mw-heading2', nlIdx + 1);
+  const dutchBlock = html.slice(nlIdx, nextLangIdx === -1 ? undefined : nextLangIdx);
+
+  let best = null;
+  for (const anchor of POS_ANCHORS) {
+    const i = dutchBlock.indexOf('id="' + anchor + '"');
+    if (i !== -1 && (best === null || i < best.pos)) best = { pos: i, anchor };
+  }
+  if (!best) return null;
+
+  const afterHeading = dutchBlock.slice(best.pos);
+  const nextHeadingIdx = afterHeading.indexOf('mw-heading', 20);
+  const sectionHtml = afterHeading.slice(0, nextHeadingIdx === -1 ? undefined : nextHeadingIdx);
+
+  const match = sectionHtml.match(/<ol[^>]*>[\s\S]*?<li[^>]*>([\s\S]*?)(?:<li[^>]*>|<\/ol>|<ol[^>]*>)/);
   if (!match) return null;
 
   const cleaned = stripTags(match[1]).replace(/\[\d+\]/g, '').trim();
-  return (cleaned && cleaned.length >= 3) ? cleaned : null;
-}
+  if (!cleaned || cleaned.length < 3) return null;
 
-async function tryStructuredLookup(candidate) {
-  const section = await findPosSectionIndex(candidate);
-  if (!section) return null;
-  const defText = await extractDefinitionFromSection(candidate, section.index);
-  if (!defText) return null;
   return {
     found: true,
-    title: section.pageTitle || candidate,
-    extract: '(' + section.heading + ') ' + defText,
+    title: (data.parse && data.parse.title) || candidate,
+    extract: '(' + best.anchor.replace(/_/g, ' ') + ') ' + cleaned,
     source: 'wiktionary-section',
     sourceUrl: 'https://nl.wiktionary.org/wiki/' + encodeURIComponent(candidate),
   };
 }
-
-
 
 module.exports = async (req, res) => {
   const word = (req.query.word || '').toString().trim();
